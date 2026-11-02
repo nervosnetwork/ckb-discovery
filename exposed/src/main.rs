@@ -10,15 +10,25 @@ use ckb_discovery_types::CKBNetworkType;
 use clap::Arg;
 use redis::AsyncCommands;
 use regex::Regex;
+use std::collections::HashMap;
 use std::str::FromStr;
+use std::sync::Arc;
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
 
+const CACHE_TTL_SECS: u64 = 30;
+
+struct NetworkCache {
+    last_update: SystemTime,
+    peers: Vec<Peer>,
+}
+
 struct ServiceData {
     client: Data<Mutex<redis::aio::MultiplexedConnection>>,
-    last_cache_update: Mutex<SystemTime>,
-    data: Mutex<Vec<Peer>>,
+    // One cache per network, so a request can never be served another
+    // network's peer list.
+    caches: Mutex<HashMap<&'static str, Arc<Mutex<NetworkCache>>>>,
 }
 
 async fn get_peer_info(
@@ -185,62 +195,91 @@ async fn peer_in_map(
     })
 }
 
+fn parse_network(network: &str) -> Option<CKBNetworkType> {
+    match network {
+        "mirana" | "ckb" | "main" | "mainnet" => Some(CKBNetworkType::Mirana),
+        "pudge" | "ckb_testnet" | "test" | "testnet" => Some(CKBNetworkType::Pudge),
+        _ => None,
+    }
+}
+
+fn network_cache_key(network: CKBNetworkType) -> &'static str {
+    match network {
+        CKBNetworkType::Mirana => "mirana",
+        CKBNetworkType::Pudge => "pudge",
+        CKBNetworkType::Dev => "dev",
+    }
+}
+
+fn peers_response(peers: Vec<Peer>) -> HttpResponse {
+    let mut builder = HttpResponse::Ok();
+    builder.insert_header(CacheControl(vec![
+        CacheDirective::MaxAge(45u32),
+        CacheDirective::MinFresh(30u32),
+    ]));
+    builder.json(peers)
+}
+
 // Define a handler function for the "/peer" endpoint
 async fn peer_handler(
     query_params: web::Query<QueryParams>,
     data: Data<ServiceData>,
 ) -> impl Responder {
-    if data.data.lock().await.is_empty()
-        || SystemTime::now()
-            .duration_since(*data.last_cache_update.lock().await)
-            .unwrap_or_default()
-            .as_secs()
-            > 30
-    {
-        let client = &data.client;
-        match get_peers(
-            CKBNetworkType::from(query_params.network.clone()),
-            query_params.offline_timeout,
-            query_params.unknown_offline_timeout,
-            client,
-        )
-        .await
-        {
-            Ok(mut peers) => {
-                if let Ok(mut d) = data.data.try_lock() {
-                    d.clear();
-                    d.append(&mut peers);
-                    data.last_cache_update
-                        .lock()
-                        .await
-                        .clone_from(&SystemTime::now());
-                    let mut builder = HttpResponse::Ok();
-                    builder.insert_header(CacheControl(vec![
-                        CacheDirective::MaxAge(45u32),
-                        CacheDirective::MinFresh(30u32),
-                    ]));
-                    builder.json(d.clone())
-                } else {
-                    let mut builder = HttpResponse::Ok();
-                    builder.insert_header(CacheControl(vec![
-                        CacheDirective::MaxAge(45u32),
-                        CacheDirective::MinFresh(30u32),
-                    ]));
-                    builder.json(peers)
-                }
-            }
-            Err(e) => {
-                eprintln!("Error getting peers: {}", e);
-                HttpResponse::InternalServerError().finish()
-            }
+    let network = match parse_network(&query_params.network) {
+        Some(network) => network,
+        None => {
+            return HttpResponse::BadRequest().json(serde_json::json!({
+                "error": "unsupported network, expected main or test"
+            }))
         }
-    } else {
-        let mut builder = HttpResponse::Ok();
-        builder.insert_header(CacheControl(vec![
-            CacheDirective::MaxAge(45u32),
-            CacheDirective::MinFresh(30u32),
-        ]));
-        builder.json(data.data.lock().await.clone())
+    };
+
+    let cache = {
+        let mut caches = data.caches.lock().await;
+        caches
+            .entry(network_cache_key(network))
+            .or_insert_with(|| {
+                Arc::new(Mutex::new(NetworkCache {
+                    last_update: SystemTime::UNIX_EPOCH,
+                    peers: Vec::new(),
+                }))
+            })
+            .clone()
+    };
+
+    // Hold the per-network cache lock across the refresh so that concurrent
+    // requests for the same network share one Redis query instead of each
+    // recomputing the whole peer list.
+    let mut cache = cache.lock().await;
+    let cache_is_fresh = SystemTime::now()
+        .duration_since(cache.last_update)
+        .unwrap_or_default()
+        .as_secs()
+        <= CACHE_TTL_SECS;
+    if cache_is_fresh {
+        return peers_response(cache.peers.clone());
+    }
+
+    match get_peers(
+        network,
+        query_params.offline_timeout,
+        query_params.unknown_offline_timeout,
+        &data.client,
+    )
+    .await
+    {
+        Ok(peers) => {
+            // Cache empty results too: refreshing on every empty response
+            // would re-run the full Redis scan per request and defeat
+            // single-flight. A transient empty window is bounded by the TTL.
+            cache.peers = peers.clone();
+            cache.last_update = SystemTime::now();
+            peers_response(peers)
+        }
+        Err(e) => {
+            eprintln!("Error getting peers: {}", e);
+            HttpResponse::InternalServerError().finish()
+        }
     }
 }
 
@@ -300,8 +339,9 @@ async fn get_peers(
                 .keys::<String, Vec<String>>("network.peer.*.pudge".to_string())
                 .await?
         }
-        _ => {
-            unreachable!()
+        CKBNetworkType::Dev => {
+            // This service only exposes mainnet/testnet data.
+            return Ok(Vec::new());
         }
     };
 
@@ -449,8 +489,7 @@ async fn main() -> std::io::Result<()> {
             .wrap(cors)
             .app_data(Data::new(ServiceData {
                 client: client.clone(),
-                last_cache_update: Mutex::new(SystemTime::UNIX_EPOCH),
-                data: Mutex::new(Default::default()),
+                caches: Mutex::new(HashMap::new()),
             }))
             .route("/peer", web::get().to(peer_handler))
             .route("/", web::get().to(peer_handler))
