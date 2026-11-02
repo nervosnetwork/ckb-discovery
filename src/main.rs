@@ -32,12 +32,31 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let conn_opts = mqtt::ConnectOptionsBuilder::new()
         .clean_start(true)
-        .keep_alive_interval(Duration::from_millis(300))
+        // paho has second resolution; sub-second values are truncated and
+        // coerced to 1 second, which makes brokers time the client out.
+        .keep_alive_interval(Duration::from_secs(300))
         .automatic_reconnect(Duration::from_millis(500), Duration::from_millis(2000))
         .user_name(mqtt_user)
         .password(mqtt_pass)
         .properties(mqtt::properties![mqtt::PropertyCode::SessionExpiryInterval => 5000])
         .finalize();
+
+    let topic = "peer/needs_dial";
+
+    // The session is clean, so the broker drops subscriptions when the
+    // connection is re-established. Restore them in the connected callback;
+    // otherwise the probe keeps running but silently stops receiving work
+    // until the process is restarted.
+    let runtime = tokio::runtime::Handle::current();
+    mqtt_client.set_connected_callback(move |client| {
+        let client = client.clone();
+        runtime.spawn(async move {
+            match client.subscribe(topic, QOS_1).await {
+                Ok(_) => info!("Subscribed to {}", topic),
+                Err(err) => error!("Failed to subscribe to {}: {:?}", topic, err),
+            }
+        });
+    });
 
     mqtt_client.connect(conn_opts).await?;
 
@@ -45,8 +64,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let mut mqtt_con = mqtt_client.get_stream(None);
 
-    let topic = "peer/needs_dial";
-
+    // Also subscribe on the initial connection; the callback covers reconnects.
     mqtt_client.subscribe(topic, QOS_1).await?;
 
     let builder_fn = |network: CKBNetworkType| {

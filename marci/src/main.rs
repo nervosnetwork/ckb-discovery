@@ -228,20 +228,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let conn_opts = mqtt::ConnectOptionsBuilder::new()
         .clean_start(true)
-        .keep_alive_interval(Duration::from_millis(100))
+        // paho has second resolution; sub-second values are truncated and
+        // coerced to 1 second, which makes brokers time the client out.
+        .keep_alive_interval(Duration::from_secs(100))
         .automatic_reconnect(Duration::from_millis(500), Duration::from_millis(2000))
         .user_name(mqtt_user)
         .password(mqtt_pass)
         .properties(mqtt::properties![mqtt::PropertyCode::SessionExpiryInterval => 5000])
         .finalize();
-
-    mqtt_client.connect(conn_opts).await?;
-
-    info!("Connected to MQTT!");
-
-    let mut mqtt_con = mqtt_client.get_stream(None);
-
-    let pub_context = mqtt_client.clone().to_owned();
 
     let topics = vec![
         "peer/online",
@@ -250,6 +244,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "peer/online2",
     ];
     let qos = vec![mqtt::QOS_1, mqtt::QOS_1, mqtt::QOS_1, mqtt::QOS_1];
+
+    // The session is clean, so subscriptions are lost whenever the client
+    // reconnects. Restore them in the connected callback; otherwise marci
+    // keeps running but stops consuming peer messages until it is restarted.
+    let runtime = tokio::runtime::Handle::current();
+    let resub_topics = topics.clone();
+    let resub_qos = qos.clone();
+    mqtt_client.set_connected_callback(move |client| {
+        let client = client.clone();
+        let topics = resub_topics.clone();
+        let qos = resub_qos.clone();
+        runtime.spawn(async move {
+            let sub_opts = vec![mqtt::SubscribeOptions::with_retain_as_published(); topics.len()];
+            match client
+                .subscribe_many_with_options(&topics, &qos, &sub_opts, None)
+                .await
+            {
+                Ok(_) => info!("Subscribed to MQTT topics"),
+                Err(err) => error!("Failed to subscribe to MQTT topics: {:?}", err),
+            }
+        });
+    });
+
+    mqtt_client.connect(conn_opts).await?;
+
+    info!("Connected to MQTT!");
+
+    let mut mqtt_con = mqtt_client.get_stream(None);
+
+    let pub_context = mqtt_client.clone().to_owned();
 
     let sub_opts = vec![mqtt::SubscribeOptions::with_retain_as_published(); topics.len()];
 
