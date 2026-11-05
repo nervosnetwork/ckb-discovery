@@ -1,6 +1,6 @@
 use ckb_discovery::handler::Handler;
 use ckb_discovery::network::meta_info_to_addr;
-use ckb_discovery_types::{CKBNetworkType, NodeMetaInfo};
+use ckb_discovery_types::{CKBNetworkType, NodeMetaInfo, ReachableInfo};
 use futures::StreamExt;
 use log::{error, info, warn};
 use nanoid::nanoid;
@@ -12,6 +12,14 @@ use paho_mqtt::QOS_1;
 use std::env;
 use std::error::Error;
 use std::time::Duration;
+
+/// Bounded MQTT input buffer. When full, newly arriving messages are dropped
+/// instead of growing an unbounded queue; dial requests are re-broadcast.
+const MQTT_STREAM_BUFFER: usize = 4096;
+/// Bounded queue of discovered peers waiting to be published.
+const REACHABLE_PUBLISH_QUEUE: usize = 8192;
+/// Upper bound on simultaneous P2P sessions per network.
+const MAX_CONNECTIONS: usize = 1024;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
@@ -62,21 +70,47 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     info!("Connected to MQTT!");
 
-    let mut mqtt_con = mqtt_client.get_stream(None);
+    let mut mqtt_con = mqtt_client.get_stream(Some(MQTT_STREAM_BUFFER));
 
     // Also subscribe on the initial connection; the callback covers reconnects.
     mqtt_client.subscribe(topic, QOS_1).await?;
 
+    // Publish discovered peers from one bounded queue instead of spawning a
+    // task per peer. A single discovery reply can list up to 1000 peers, and
+    // thousands of replies per cycle previously produced an unbounded number
+    // of concurrent publish tasks.
+    let (reachable_tx, mut reachable_rx) =
+        tokio::sync::mpsc::channel::<ReachableInfo>(REACHABLE_PUBLISH_QUEUE);
+    let reachable_client = mqtt_client.clone().to_owned();
+    tokio::spawn(async move {
+        while let Some(reachable) = reachable_rx.recv().await {
+            let payload = match serde_json::to_vec(&reachable) {
+                Ok(payload) => payload,
+                Err(error) => {
+                    error!("Failed to serialize reachable peer: {:?}", error);
+                    continue;
+                }
+            };
+            if let Err(error) = reachable_client
+                .publish(mqtt::Message::new("peer/reachable", payload, QOS_1))
+                .await
+            {
+                error!("Failed to publish reachable peer: {:?}", error);
+            }
+        }
+    });
+
     let builder_fn = |network: CKBNetworkType| {
         let mqtt_ctx = mqtt_client.clone().to_owned();
         let mut service_builder = p2p::builder::ServiceBuilder::new();
-        let handler = Handler::new(network, mqtt_ctx);
+        let handler = Handler::new(network, mqtt_ctx, reachable_tx.clone());
 
         for meta in handler.build_protocol_metas() {
             service_builder = service_builder.insert_protocol(meta);
         }
         service_builder
             .forever(true)
+            .max_connection_number(MAX_CONNECTIONS)
             .handshake_type(SecioKeyPair::secp256k1_generated().into())
             .yamux_config(Config::default())
             .set_recv_buffer_size(24 * 1024 * 1024)

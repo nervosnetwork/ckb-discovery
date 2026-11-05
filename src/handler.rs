@@ -13,13 +13,31 @@ use p2p::context::{ProtocolContext, ProtocolContextMutRef, ServiceContext};
 use p2p::multiaddr::Multiaddr;
 use p2p::service::{ProtocolHandle, ProtocolMeta, ServiceError, ServiceEvent};
 use p2p::traits::{ServiceHandle, ServiceProtocol};
+use p2p::SessionId;
 use paho_mqtt as mqtt;
-use paho_mqtt::QOS_1;
+use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::sync::{mpsc, Mutex};
+
+/// A peer that identifies but never answers our discovery request would keep
+/// its session (and buffers) alive indefinitely. Give it a bounded amount of
+/// time to respond, then close it.
+const DISCOVERY_SESSION_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Log the closed-queue failure once instead of once per discovered peer.
+static PUBLISH_QUEUE_CLOSED: std::sync::Once = std::sync::Once::new();
 
 pub struct Handler {
     network_type: CKBNetworkType,
     mqtt_context: mqtt::AsyncClient,
+    reachable_tx: mpsc::Sender<ReachableInfo>,
+    /// Sessions still waiting for a discovery response, with the generation
+    /// they were opened in. The generation prevents a stale timeout task from
+    /// acting on a later session that reuses the same id.
+    awaiting_discovery: Arc<Mutex<BTreeMap<SessionId, u64>>>,
+    session_generation: Arc<AtomicU64>,
 }
 
 impl Clone for Handler {
@@ -27,15 +45,25 @@ impl Clone for Handler {
         Self {
             network_type: self.network_type,
             mqtt_context: self.mqtt_context.clone().to_owned(),
+            reachable_tx: self.reachable_tx.clone(),
+            awaiting_discovery: self.awaiting_discovery.clone(),
+            session_generation: self.session_generation.clone(),
         }
     }
 }
 
 impl Handler {
-    pub fn new(network_type: CKBNetworkType, mqtt_context: mqtt::AsyncClient) -> Self {
+    pub fn new(
+        network_type: CKBNetworkType,
+        mqtt_context: mqtt::AsyncClient,
+        reachable_tx: mpsc::Sender<ReachableInfo>,
+    ) -> Self {
         Self {
             network_type,
             mqtt_context,
+            reachable_tx,
+            awaiting_discovery: Arc::new(Mutex::new(BTreeMap::new())),
+            session_generation: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -139,6 +167,11 @@ impl Handler {
         if let Ok(message) = packed::DiscoveryMessage::from_compatible_slice(data.as_ref()) {
             match message.payload().to_enum() {
                 packed::DiscoveryPayloadUnion::Nodes(discovery_nodes) => {
+                    // The peer answered us; it no longer needs the idle-session timer.
+                    self.awaiting_discovery
+                        .lock()
+                        .await
+                        .remove(&context.session.id);
                     info!(
                         "Received DiscoveryMessages Nodes, address: {}, nodes.len: {}",
                         context.session.address,
@@ -163,29 +196,30 @@ impl Handler {
                         }
                         // filter out loopback addresses
                         meta.addresses.retain(|e| !e.address.is_loopback());
-                        let mqtt_context = self.mqtt_context.clone().to_owned();
 
-                        tokio::spawn(async move {
-                            if let Err(error) = mqtt_context
-                                .publish(mqtt::Message::new(
-                                    "peer/reachable",
-                                    serde_json::to_vec(&ReachableInfo::new(
-                                        meta.clone(),
-                                        from_shadow.clone(),
-                                    ))
-                                    .unwrap_or_default(),
-                                    QOS_1,
-                                ))
-                                .await
-                            {
-                                error!(
-                                    "Failed to publish peer {:?} to online! error: {:?}",
-                                    meta, error
-                                );
+                        // Never spawn one task per discovered node: a single
+                        // discovery reply can carry up to 1000 nodes. Hand
+                        // them to the bounded publisher queue instead, so a
+                        // slow or overloaded MQTT client drops excess peers
+                        // rather than accumulating tasks and payloads.
+                        match self
+                            .reachable_tx
+                            .try_send(ReachableInfo::new(meta, from_shadow))
+                        {
+                            Ok(_) => {}
+                            Err(mpsc::error::TrySendError::Full(_)) => {
+                                debug!("Dropping reachable peer, publish queue is full");
                             }
-                        });
-                        let _ = context.disconnect(context.session.id).await;
+                            Err(mpsc::error::TrySendError::Closed(_)) => {
+                                PUBLISH_QUEUE_CLOSED.call_once(|| {
+                                    error!(
+                                        "Reachable publish queue is closed; discovered peers will not be published"
+                                    );
+                                });
+                            }
+                        }
                     }
+                    let _ = context.disconnect(context.session.id).await;
                 }
                 packed::DiscoveryPayloadUnion::GetNodes(_discovery_get_nodes) => {} // discard
             }
@@ -226,17 +260,52 @@ impl ServiceHandle for Handler {
     }
 
     /// Handling session establishment and disconnection events
-    async fn handle_event(&mut self, _control: &mut ServiceContext, event: ServiceEvent) {
+    async fn handle_event(&mut self, control: &mut ServiceContext, event: ServiceEvent) {
         match event {
             ServiceEvent::SessionOpen {
                 session_context: session,
             } => {
                 debug!("Session open: {:?}", session);
+                // Close sessions that never answer our discovery request.
+                // Silent peers otherwise keep the session and its buffers
+                // allocated for as long as the connection remains open.
+                let awaiting_discovery = self.awaiting_discovery.clone();
+                let control = control.control().clone();
+                let session_id = session.id;
+                let generation = self.session_generation.fetch_add(1, Ordering::Relaxed);
+                awaiting_discovery
+                    .lock()
+                    .await
+                    .insert(session_id, generation);
+                tokio::spawn(async move {
+                    tokio::time::sleep(DISCOVERY_SESSION_TIMEOUT).await;
+                    // Remove first: if a discovery response arrived, the
+                    // responder already removed the session, and we must not
+                    // disconnect a healthy peer. The generation check also
+                    // ignores stale timers if the id was ever reused.
+                    let still_waiting = {
+                        let mut sessions = awaiting_discovery.lock().await;
+                        if sessions.get(&session_id) == Some(&generation) {
+                            sessions.remove(&session_id);
+                            true
+                        } else {
+                            false
+                        }
+                    };
+                    if still_waiting {
+                        debug!(
+                            "Closing session {}: no discovery response within {:?}",
+                            session_id, DISCOVERY_SESSION_TIMEOUT
+                        );
+                        let _ = control.disconnect(session_id).await;
+                    }
+                });
             }
             ServiceEvent::SessionClose {
                 session_context: session,
             } => {
                 debug!("Session close: {:?}", session.clone());
+                self.awaiting_discovery.lock().await.remove(&session.id);
             }
             _ => {
                 debug!("Session event: {:?}", event);

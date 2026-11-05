@@ -13,6 +13,11 @@ use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 use tokio::time::Duration;
 
+/// Bounded MQTT input buffer. If Redis/ipinfo processing falls behind, paho
+/// drops messages instead of growing an unbounded queue; discovery re-sends
+/// peer announcements on subsequent cycles.
+const MQTT_STREAM_BUFFER: usize = 10_000;
+
 async fn _check_peer_online(con: &mut redis::aio::MultiplexedConnection, peer_id: String) -> bool {
     con.keys::<&String, Vec<String>>(&peer_id)
         .await
@@ -271,7 +276,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!("Connected to MQTT!");
 
-    let mut mqtt_con = mqtt_client.get_stream(None);
+    let mut mqtt_con = mqtt_client.get_stream(Some(MQTT_STREAM_BUFFER));
 
     let pub_context = mqtt_client.clone().to_owned();
 
