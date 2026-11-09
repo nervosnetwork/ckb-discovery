@@ -1,5 +1,6 @@
 services:
   redis:
+    restart: unless-stopped
     networks:
       - ckb-discovery
     image: 'bitnami/redis:latest'
@@ -23,6 +24,7 @@ services:
       - "1883:1883"
       - "18083:18083"
   exposed:
+    restart: unless-stopped
     networks:
       - ckb-discovery
     environment:
@@ -35,6 +37,7 @@ services:
     depends_on:
       - redis
   marci:
+    restart: unless-stopped
     networks:
       - ckb-discovery
     environment:
